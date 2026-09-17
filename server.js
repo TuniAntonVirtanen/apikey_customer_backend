@@ -1,3 +1,5 @@
+// CUSTOMER BACKEND
+
 import express from "express";
 import session from "express-session";
 import crypto from "crypto";
@@ -43,16 +45,70 @@ const MOCK_DATA = {
 };
 
 // ===========================================================================
-// IN-MEMORY STORES
+// OAUTH IN-MEMORY STORES (PROTOTYPE SIMULATION)
+// PROD NOTE: Replace these Map() instances with PostgreSQL/Redis.
 // ===========================================================================
 const registeredClients = new Map(); // client_id -> client metadata
-const authorizationCodes = new Map(); // code -> auth state
+const authorizationCodes = new Map(); // code -> auth state (code_challenge, userId, resource, etc.)
 
-// Single active API key state (as requested)
-let activeApiKey = null; // { key: string, username: string, expiresAt: number }
+// ===========================================================================
+// API KEY STORE (PROTOTYPE SIMULATION)
+// Only one API key is ever active at a time. Generating a new one silently
+// overwrites/invalidates the previous one. Only a hash of the key is kept
+// server-side; the raw key is returned to the caller exactly once, at
+// generation time, and can never be retrieved again after that.
+// PROD NOTE: Replace with a persisted, indexed store (DB) if multiple
+// concurrent keys / multiple users are ever needed.
+// ===========================================================================
+let activeApiKey = null;
+// shape when set: { hash: string, username: string, issuedAt: number, expiresAt: number }
+
+const API_KEY_MIN_MINUTES = 1;
+const API_KEY_MAX_MINUTES = 1440; // 24h ceiling — keeps the UI from minting a de-facto permanent key
+
+function hashApiKey(rawKey) {
+  return crypto.createHash("sha256").update(rawKey).digest("hex");
+}
+
+function generateAndStoreApiKey(username, minutes) {
+  const rawKey = "sk_" + crypto.randomBytes(32).toString("base64url");
+  const now = Date.now();
+  const expiresAt = now + minutes * 60 * 1000;
+
+  activeApiKey = {
+    hash: hashApiKey(rawKey),
+    username,
+    issuedAt: now,
+    expiresAt
+  };
+
+  return { rawKey, issuedAt: now, expiresAt };
+}
+
+// Freshness + identity check for a presented API key. Constant-time
+// comparison is used so that checking an invalid key can't leak timing
+// information about the stored hash.
+function checkApiKey(providedKey) {
+  if (!activeApiKey) return { valid: false, reason: "no_active_key" };
+  if (Date.now() > activeApiKey.expiresAt) return { valid: false, reason: "expired" };
+  if (typeof providedKey !== "string" || providedKey.length === 0) {
+    return { valid: false, reason: "malformed" };
+  }
+
+  const providedHash = hashApiKey(providedKey);
+  const a = Buffer.from(providedHash, "hex");
+  const b = Buffer.from(activeApiKey.hash, "hex");
+
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return { valid: false, reason: "mismatch" };
+  }
+
+  return { valid: true, username: activeApiKey.username, expiresAt: activeApiKey.expiresAt };
+}
 
 // ===========================================================================
 // CRYPTOGRAPHIC KEYS (RS256)
+// PROD NOTE: Load persistent RSA keys from environment secrets or AWS KMS.
 // ===========================================================================
 const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -94,8 +150,17 @@ app.get("/.well-known/openid-configuration", (req, res) => {
   res.redirect("/.well-known/oauth-authorization-server");
 });
 
-// Primary Customer Frontend UI
+// Require an active session (same convention as the rest of the frontend routes)
+function requireSession(req, res, next) {
+  if (!req.session?.isLoggedIn) {
+    return res.status(401).json({ error: "unauthorized", message: "Log in first." });
+  }
+  next();
+}
+
 app.get("/", (req, res) => {
+  console.log(`[BACKEND ROOT] Session ID: ${req.sessionID}, LoggedIn: ${!!req.session?.isLoggedIn}`);
+
   if (req.session.isLoggedIn) {
     const ws1Text = `Active Sprint: ${MOCK_DATA.workspace1.completedTasks} completed tasks, ${MOCK_DATA.workspace1.inProgressTasks} in progress`;
     const ws2Chart = Object.entries(MOCK_DATA.workspace2)
@@ -105,40 +170,12 @@ app.get("/", (req, res) => {
       .map(([from, to]) => `${from} -> ${to}`)
       .join(", ");
 
-    // Check existing API Key status for rendering
-    let apiKeyStatusHtml = "<p>No active API key generated.</p>";
-    if (activeApiKey) {
-      const isExpired = Date.now() > activeApiKey.expiresAt;
-      if (isExpired) {
-        apiKeyStatusHtml = `<p style="color: red;"><strong>Active API Key Expired!</strong> Generate a new key below.</p>`;
-      } else {
-        const remainingSec = Math.round((activeApiKey.expiresAt - Date.now()) / 1000);
-        apiKeyStatusHtml = `
-          <div style="background: #eef; padding: 10px; border-radius: 4px;">
-            <p style="margin: 0 0 5px 0;">Active Key: <code style="font-size: 1.1em; background: #fff; padding: 2px 6px;">${activeApiKey.key}</code></p>
-            <small style="color: #555;">Expires in: ${remainingSec} seconds</small>
-          </div>
-        `;
-      }
-    }
-
     return res.send(`
-      <div style="font-family: sans-serif; padding: 20px; max-width: 600px;">
+      <div style="font-family: sans-serif; padding: 20px;">
         <h2>Welcome to Mock Customer Dashboard 🎉</h2>
         <p>Logged in as: <strong>${req.session.username}</strong></p>
 
         <hr style="margin: 20px 0;">
-
-        <!-- API KEY GENERATOR SECTION -->
-        <div style="border: 2px solid #4A90E2; padding: 15px; margin-bottom: 20px; border-radius: 6px; background-color: #f4f8ff;">
-          <h3>MCP API Key Generator</h3>
-          ${apiKeyStatusHtml}
-          <form action="/generate-api-key" method="POST" style="margin-top: 15px;">
-            <label>Duration (Minutes):</label><br>
-            <input type="number" name="minutes" min="1" max="1440" value="15" required style="padding: 5px; width: 80px; margin-top: 5px;" />
-            <button type="submit" style="padding: 6px 12px; margin-left: 10px; cursor: pointer;">Generate API Key</button>
-          </form>
-        </div>
 
         <div style="border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; border-radius: 4px;">
           <h3>Workspace 1</h3>
@@ -155,10 +192,51 @@ app.get("/", (req, res) => {
           <p>${ws3Text}</p>
         </div>
 
+        <div style="border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; border-radius: 4px;">
+          <h3>API Key (for MCP / external tools)</h3>
+          <div>
+            <label>Valid for (minutes):</label><br>
+            <input type="number" id="apiKeyMinutes" value="15" min="${API_KEY_MIN_MINUTES}" max="${API_KEY_MAX_MINUTES}" style="padding: 5px; width: 100px;" />
+            <button type="button" id="genApiKeyBtn" style="padding: 8px 16px;">Generate API Key</button>
+          </div>
+          <div id="apiKeyResult" style="margin-top: 10px; display: none;">
+            <input type="text" id="apiKeyValue" readonly style="width: 70%; padding: 5px; font-family: monospace;" />
+            <button type="button" id="copyApiKeyBtn" style="padding: 8px 12px;">Copy</button>
+            <p id="apiKeyExpiry" style="font-size: 12px; color: #555;"></p>
+            <p style="font-size: 12px; color: #b00;">This key is shown once. Generating a new one invalidates this one.</p>
+          </div>
+        </div>
+
         <br>
         <form action="/logout" method="POST">
           <button type="submit" style="padding: 8px 16px;">Log Out</button>
         </form>
+
+        <script>
+          document.getElementById("genApiKeyBtn").addEventListener("click", async () => {
+            const minutes = document.getElementById("apiKeyMinutes").value;
+            const res = await fetch("/account/api-key/generate", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ minutes: Number(minutes) })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              alert(data.message || "Failed to generate API key.");
+              return;
+            }
+            document.getElementById("apiKeyValue").value = data.api_key;
+            document.getElementById("apiKeyExpiry").textContent =
+              "Expires at " + new Date(data.expires_at).toLocaleString();
+            document.getElementById("apiKeyResult").style.display = "block";
+          });
+
+          document.getElementById("copyApiKeyBtn").addEventListener("click", () => {
+            const input = document.getElementById("apiKeyValue");
+            input.select();
+            navigator.clipboard.writeText(input.value);
+          });
+        </script>
       </div>
     `);
   }
@@ -182,36 +260,18 @@ app.get("/", (req, res) => {
   `);
 });
 
-// API Key Generation Handler
-app.post("/generate-api-key", (req, res) => {
-  if (!req.session || !req.session.isLoggedIn) {
-    return res.status(401).send("Unauthorized");
-  }
-
-  const minutes = parseInt(req.body.minutes, 10) || 15;
-  const key = "mcp_key_" + crypto.randomBytes(16).toString("hex");
-  const expiresAt = Date.now() + minutes * 60 * 1000;
-
-  // Overwrites existing single API key state
-  activeApiKey = {
-    key,
-    username: req.session.username,
-    expiresAt
-  };
-
-  console.log(`[API KEY GENERATED] Key: ${key}, Expires in: ${minutes} mins`);
-  res.redirect("/");
-});
-
 app.post("/login", (req, res) => {
   const { username, password } = req.body;
   if (username === MOCK_USER.username && password === MOCK_USER.password) {
     req.session.isLoggedIn = true;
     req.session.username = username;
 
+    const redirectTo = req.session.returnTo || "/";
+    delete req.session.returnTo;
+
     return req.session.save((err) => {
       if (err) console.error(`[BACKEND LOGIN ERROR] Session save failed:`, err);
-      res.redirect("/");
+      res.redirect(redirectTo);
     });
   }
 
@@ -226,7 +286,64 @@ app.post("/logout", (req, res) => {
 });
 
 // ===========================================================================
-// 2. DATA API
+// 1b. API KEY ROUTES
+// ===========================================================================
+
+app.post("/account/api-key/generate", requireSession, (req, res) => {
+  const minutesRaw = Number(req.body.minutes);
+
+  if (!Number.isFinite(minutesRaw) || minutesRaw < API_KEY_MIN_MINUTES || minutesRaw > API_KEY_MAX_MINUTES) {
+    return res.status(400).json({
+      error: "invalid_request",
+      message: `minutes must be a number between ${API_KEY_MIN_MINUTES} and ${API_KEY_MAX_MINUTES}.`
+    });
+  }
+
+  const minutes = Math.floor(minutesRaw);
+  const { rawKey, issuedAt, expiresAt } = generateAndStoreApiKey(req.session.username, minutes);
+
+  console.log(`[API-KEY] Generated for ${req.session.username}, valid ${minutes}m (expires ${new Date(expiresAt).toISOString()})`);
+
+  res.json({
+    api_key: rawKey, // shown once — server only retains a hash from here on
+    issued_at: issuedAt,
+    expires_at: expiresAt,
+    expires_in_minutes: minutes
+  });
+});
+
+// Lets the dashboard (or anything else with a session) check key status
+// without ever re-exposing the raw key or the stored hash.
+app.get("/account/api-key/status", requireSession, (req, res) => {
+  if (!activeApiKey || Date.now() > activeApiKey.expiresAt) {
+    return res.json({ active: false });
+  }
+  res.json({
+    active: true,
+    expires_at: activeApiKey.expiresAt,
+    issued_for: activeApiKey.username
+  });
+});
+
+// Standalone freshness/validity check for a presented API key. No session
+// required here — this is the endpoint an external caller (e.g. mcp-app,
+// in a later step) hits with the key the user pasted in.
+app.post("/account/api-key/validate", (req, res) => {
+  const { api_key } = req.body;
+  if (!api_key) {
+    return res.status(400).json({ error: "invalid_request", message: "api_key is required." });
+  }
+
+  const result = checkApiKey(api_key);
+  if (!result.valid) {
+    return res.status(401).json({ valid: false, reason: result.reason });
+  }
+
+  res.json({ valid: true, username: result.username, expires_at: result.expiresAt });
+});
+
+// ===========================================================================
+// 2. DATA API (FOR MCP BACKEND CONSUMPTION)
 // ===========================================================================
 
 app.get("/api/data", (req, res) => {
@@ -237,6 +354,11 @@ app.get("/api/data", (req, res) => {
 
   const token = authHeader.split(" ")[1];
   try {
+    // PROD NOTE: Verify signed RS256 JWT
+    // NOTE: This endpoint is only ever called internally by mcp-backend, which
+    // forwards a token whose `aud` is the mcp-app resource (see /oauth/token below).
+    // It intentionally does not re-check `aud` here, since that binding is enforced
+    // at mcp-app (the actual protected resource) and again at mcp-backend.
     jwt.verify(token, publicKey, { algorithms: ["RS256"] });
     res.json(MOCK_DATA);
   } catch (err) {
@@ -244,8 +366,46 @@ app.get("/api/data", (req, res) => {
   }
 });
 
+// Visual widget route
+app.get("/widget/bar-chart", (req, res) => {
+  const chartData = MOCK_DATA.workspace2;
+  const maxVal = Math.max(...Object.values(chartData));
+
+  const bars = Object.entries(chartData).map(([label, val]) => {
+    const heightPercent = (val / maxVal) * 100;
+    return `
+      <div style="display: flex; flex-direction: column; align-items: center; width: 40px;">
+        <div style="font-size: 12px; margin-bottom: 4px;">${val}</div>
+        <div style="width: 100%; height: ${heightPercent}%; background-color: #4A90E2; border-radius: 4px 4px 0 0;"></div>
+        <div style="font-weight: bold; margin-top: 8px;">${label}</div>
+      </div>
+    `;
+  }).join("");
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <style>
+        body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f9f9f9; }
+        .chart-container { display: flex; align-items: flex-end; gap: 20px; height: 150px; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+      </style>
+    </head>
+    <body>
+      <div class="chart-container">
+        ${bars}
+      </div>
+    </body>
+    </html>
+  `);
+});
+
 // ===========================================================================
-// 3. OAUTH / API KEY VERIFICATION BRIDGE ENDPOINTS
+// 3. OAUTH / MCP BRIDGE ENDPOINTS
+// NOTE: This section is UNCHANGED from the redirect-based prototype and is
+// slated for replacement in the next step, once the API-key flow above is
+// wired into mcp-app. Left intact here so the existing flow keeps working
+// until that swap happens.
 // ===========================================================================
 
 app.post("/oauth/register", (req, res) => {
@@ -265,135 +425,72 @@ app.post("/oauth/register", (req, res) => {
   res.status(201).json(clientMetadata);
 });
 
-// GET /oauth/authorize: Render API Key Input Form Directly
 app.get("/oauth/authorize", (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, resource } = req.query;
 
-  console.log("[OAUTH AUTHORIZE GET]", { client_id, redirect_uri, resource });
-
-  // 1. Validate Client ID
   const client = registeredClients.get(client_id);
   if (!client) {
-    console.error("[OAUTH ERROR] Unknown client_id:", client_id);
-    return res.status(400).send("OAuth Error: Unknown client_id. Please re-connect in ChatGPT.");
+    return res.status(400).json({
+      error: "invalid_client",
+      error_description: "Unknown client_id. Register via /oauth/register first."
+    });
+  }
+  if (!redirect_uri || !client.redirect_uris.includes(redirect_uri)) {
+    return res.status(400).json({
+      error: "invalid_request",
+      error_description: "redirect_uri does not match a redirect_uri registered for this client."
+    });
   }
 
-  // 2. Flexible Redirect URI Validation (Match Origin + Path)
-  if (!redirect_uri) {
-    return res.status(400).send("OAuth Error: Missing redirect_uri.");
+  if (!resource) {
+    return res.status(400).json({
+      error: "invalid_target",
+      error_description: "resource parameter is required to bind the issued token to a specific protected resource."
+    });
+  }
+  try {
+    new URL(resource);
+  } catch {
+    return res.status(400).json({
+      error: "invalid_target",
+      error_description: "resource must be a valid absolute URI."
+    });
   }
 
-  const cleanRedirect = (uri) => {
-    try {
-      const parsed = new URL(uri);
-      return parsed.origin + parsed.pathname.replace(/\/$/, "");
-    } catch (e) {
-      return uri;
-    }
-  };
-
-  const isRedirectAllowed = client.redirect_uris.some(
-    (allowed) => cleanRedirect(allowed) === cleanRedirect(redirect_uri)
-  );
-
-  if (!isRedirectAllowed) {
-    console.error("[OAUTH ERROR] redirect_uri mismatch. Received:", redirect_uri, "Registered:", client.redirect_uris);
-    return res.status(400).send(`OAuth Error: Invalid redirect_uri.`);
+  if (!req.session || !req.session.isLoggedIn) {
+    req.session.returnTo = req.originalUrl;
+    return req.session.save((err) => {
+      if (err) console.error(`[BACKEND AUTHORIZE ERROR] Session save failed:`, err);
+      res.redirect("/");
+    });
   }
 
-  // 3. Render ONLY the API Key Form (Do not check sessions or redirect to /)
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Authorize MCP Access</title>
-      <style>
-        body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f9f9f9; }
-        .card { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
-        input[type="text"] { width: 100%; padding: 10px; margin: 10px 0 20px 0; box-sizing: border-box; font-size: 14px; }
-        button { width: 100%; padding: 12px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; font-weight: bold; }
-        button:hover { background: #0052a3; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h2 style="margin-top: 0;">MCP Authorization</h2>
-        <p style="color: #555;">Paste the API key generated from your Customer Dashboard below to connect.</p>
-        
-        <form action="/oauth/authorize" method="POST">
-          <input type="hidden" name="client_id" value="${client_id}" />
-          <input type="hidden" name="redirect_uri" value="${redirect_uri}" />
-          <input type="hidden" name="state" value="${state || ""}" />
-          <input type="hidden" name="code_challenge" value="${code_challenge || ""}" />
-          <input type="hidden" name="resource" value="${resource || ""}" />
-
-          <label><strong>API Key:</strong></label>
-          <input type="text" name="api_key" placeholder="mcp_key_..." required autofocus />
-
-          <button type="submit">Authenticate & Connect</button>
-        </form>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-// POST /oauth/authorize: Validate API Key & Exchange for Authorization Code
-// POST /oauth/authorize: Validate API Key & Exchange for Authorization Code
-app.post("/oauth/authorize", express.urlencoded({ extended: true }), (req, res) => {
-  const { client_id, redirect_uri, state, code_challenge, resource, api_key } = req.body;
-
-  // 1. Verify API key presence and match
-  if (!activeApiKey || !api_key || activeApiKey.key !== api_key.trim()) {
-    return res.status(401).send(`
-      <div style="font-family: sans-serif; padding: 20px; color: red;">
-        <h3>Authentication Failed ❌</h3>
-        <p>Invalid API Key provided.</p>
-        <a href="javascript:history.back()">Try Again</a>
-      </div>
-    `);
+  if (!code_challenge || code_challenge_method !== "S256") {
+    return res.status(400).send("OAuth 2.1 requires PKCE with S256 code_challenge_method.");
   }
 
-  // 2. Verify freshness/expiration timestamp
-  if (Date.now() > activeApiKey.expiresAt) {
-    return res.status(401).send(`
-      <div style="font-family: sans-serif; padding: 20px; color: red;">
-        <h3>Authentication Failed ❌</h3>
-        <p>This API Key has expired. Please generate a new key from your dashboard.</p>
-        <a href="javascript:history.back()">Try Again</a>
-      </div>
-    `);
-  }
-
-  // 3. Issue Authorization Code bound to the key owner
   const mockAuthCode = "auth_code_" + crypto.randomBytes(12).toString("hex");
   authorizationCodes.set(mockAuthCode, {
     clientId: client_id,
     redirectUri: redirect_uri,
     codeChallenge: code_challenge,
     resource,
-    username: activeApiKey.username,
+    username: req.session.username,
     expiresAt: Date.now() + 10 * 60 * 1000
   });
 
-  // 4. Build redirect safely preserving pre-existing query parameters on redirect_uri
-  try {
+  if (redirect_uri) {
     const redirectUrl = new URL(redirect_uri);
     redirectUrl.searchParams.set("code", mockAuthCode);
-    
-    // Only set state if a valid non-empty state was supplied by ChatGPT
-    if (state && state !== "undefined" && state !== "null") {
-      redirectUrl.searchParams.set("state", state);
-    }
+    if (state) redirectUrl.searchParams.set("state", state);
 
     const hostUrl = `${req.protocol}://${req.get("host")}`;
     redirectUrl.searchParams.set("iss", hostUrl);
 
     return res.redirect(redirectUrl.toString());
-  } catch (err) {
-    console.error("[OAUTH REDIRECT ERROR]", err.message);
-    return res.status(400).send("Invalid redirect_uri supplied during authorization.");
   }
+
+  res.send(`Authorization Granted! Code: ${mockAuthCode}`);
 });
 
 app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
@@ -414,18 +511,17 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   if (client_id && client_id !== authData.clientId) {
     return res.status(400).json({
       error: "invalid_grant",
-      error_description: "client_id does not match."
+      error_description: "client_id does not match the client this authorization code was issued to."
     });
   }
 
   if (resource && resource !== authData.resource) {
     return res.status(400).json({
       error: "invalid_target",
-      error_description: "resource does not match."
+      error_description: "resource does not match the resource requested during authorization."
     });
   }
 
-  // PKCE Check
   const calculatedChallenge = crypto
     .createHash("sha256")
     .update(code_verifier)
