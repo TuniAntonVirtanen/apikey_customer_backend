@@ -265,30 +265,43 @@ app.post("/oauth/register", (req, res) => {
   res.status(201).json(clientMetadata);
 });
 
-// GET /oauth/authorize: ALWAYS render the API Key form directly
+// GET /oauth/authorize: Render API Key Input Form Directly
 app.get("/oauth/authorize", (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, resource } = req.query;
 
-  // 1. OAuth Parameter Validations
+  console.log("[OAUTH AUTHORIZE GET]", { client_id, redirect_uri, resource });
+
+  // 1. Validate Client ID
   const client = registeredClients.get(client_id);
   if (!client) {
-    return res.status(400).json({ error: "invalid_client", error_description: "Unknown client_id." });
+    console.error("[OAUTH ERROR] Unknown client_id:", client_id);
+    return res.status(400).send("OAuth Error: Unknown client_id. Please re-connect in ChatGPT.");
   }
 
-  if (!redirect_uri || !client.redirect_uris.includes(redirect_uri)) {
-    return res.status(400).json({ error: "invalid_request", error_description: "Invalid redirect_uri." });
+  // 2. Flexible Redirect URI Validation (Match Origin + Path)
+  if (!redirect_uri) {
+    return res.status(400).send("OAuth Error: Missing redirect_uri.");
   }
 
-  if (!resource) {
-    return res.status(400).json({ error: "invalid_target", error_description: "resource parameter is required." });
+  const cleanRedirect = (uri) => {
+    try {
+      const parsed = new URL(uri);
+      return parsed.origin + parsed.pathname.replace(/\/$/, "");
+    } catch (e) {
+      return uri;
+    }
+  };
+
+  const isRedirectAllowed = client.redirect_uris.some(
+    (allowed) => cleanRedirect(allowed) === cleanRedirect(redirect_uri)
+  );
+
+  if (!isRedirectAllowed) {
+    console.error("[OAUTH ERROR] redirect_uri mismatch. Received:", redirect_uri, "Registered:", client.redirect_uris);
+    return res.status(400).send(`OAuth Error: Invalid redirect_uri.`);
   }
 
-  if (!code_challenge || code_challenge_method !== "S256") {
-    return res.status(400).send("OAuth 2.1 requires PKCE with S256 code_challenge_method.");
-  }
-
-  // 2. Render ONLY the API Key input page. 
-  // DO NOT check req.session or redirect to "/" here!
+  // 3. Render ONLY the API Key Form (Do not check sessions or redirect to /)
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -297,25 +310,27 @@ app.get("/oauth/authorize", (req, res) => {
       <style>
         body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f9f9f9; }
         .card { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
-        input[type="text"] { width: 100%; padding: 10px; margin: 10px 0 20px 0; box-sizing: border-box; }
-        button { width: 100%; padding: 10px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        input[type="text"] { width: 100%; padding: 10px; margin: 10px 0 20px 0; box-sizing: border-box; font-size: 14px; }
+        button { width: 100%; padding: 12px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; font-weight: bold; }
+        button:hover { background: #0052a3; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h2>MCP API Key Authentication</h2>
-        <p>Enter the API key generated from your dashboard to authorize access.</p>
+        <h2 style="margin-top: 0;">MCP Authorization</h2>
+        <p style="color: #555;">Paste the API key generated from your Customer Dashboard below to connect.</p>
+        
         <form action="/oauth/authorize" method="POST">
           <input type="hidden" name="client_id" value="${client_id}" />
           <input type="hidden" name="redirect_uri" value="${redirect_uri}" />
           <input type="hidden" name="state" value="${state || ""}" />
-          <input type="hidden" name="code_challenge" value="${code_challenge}" />
-          <input type="hidden" name="resource" value="${resource}" />
+          <input type="hidden" name="code_challenge" value="${code_challenge || ""}" />
+          <input type="hidden" name="resource" value="${resource || ""}" />
 
           <label><strong>API Key:</strong></label>
           <input type="text" name="api_key" placeholder="mcp_key_..." required autofocus />
 
-          <button type="submit">Authenticate & Authorize</button>
+          <button type="submit">Authenticate & Connect</button>
         </form>
       </div>
     </body>
