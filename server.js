@@ -324,11 +324,12 @@ app.get("/oauth/authorize", (req, res) => {
 });
 
 // POST /oauth/authorize: Validate API Key & Exchange for Authorization Code
+// POST /oauth/authorize: Validate API Key & Exchange for Authorization Code
 app.post("/oauth/authorize", express.urlencoded({ extended: true }), (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, resource, api_key } = req.body;
 
   // 1. Verify API key presence and match
-  if (!activeApiKey || activeApiKey.key !== api_key.trim()) {
+  if (!activeApiKey || !api_key || activeApiKey.key !== api_key.trim()) {
     return res.status(401).send(`
       <div style="font-family: sans-serif; padding: 20px; color: red;">
         <h3>Authentication Failed ❌</h3>
@@ -360,14 +361,24 @@ app.post("/oauth/authorize", express.urlencoded({ extended: true }), (req, res) 
     expiresAt: Date.now() + 10 * 60 * 1000
   });
 
-  const redirectUrl = new URL(redirect_uri);
-  redirectUrl.searchParams.set("code", mockAuthCode);
-  if (state) redirectUrl.searchParams.set("state", state);
+  // 4. Build redirect safely preserving pre-existing query parameters on redirect_uri
+  try {
+    const redirectUrl = new URL(redirect_uri);
+    redirectUrl.searchParams.set("code", mockAuthCode);
+    
+    // Only set state if a valid non-empty state was supplied by ChatGPT
+    if (state && state !== "undefined" && state !== "null") {
+      redirectUrl.searchParams.set("state", state);
+    }
 
-  const hostUrl = `${req.protocol}://${req.get("host")}`;
-  redirectUrl.searchParams.set("iss", hostUrl);
+    const hostUrl = `${req.protocol}://${req.get("host")}`;
+    redirectUrl.searchParams.set("iss", hostUrl);
 
-  return res.redirect(redirectUrl.toString());
+    return res.redirect(redirectUrl.toString());
+  } catch (err) {
+    console.error("[OAUTH REDIRECT ERROR]", err.message);
+    return res.status(400).send("Invalid redirect_uri supplied during authorization.");
+  }
 });
 
 app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
