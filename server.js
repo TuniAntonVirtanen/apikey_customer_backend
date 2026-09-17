@@ -265,37 +265,30 @@ app.post("/oauth/register", (req, res) => {
   res.status(201).json(clientMetadata);
 });
 
-// GET /oauth/authorize: Render API Key Input Screen
+// GET /oauth/authorize: ALWAYS render the API Key form directly
 app.get("/oauth/authorize", (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, resource } = req.query;
 
+  // 1. OAuth Parameter Validations
   const client = registeredClients.get(client_id);
   if (!client) {
-    return res.status(400).json({
-      error: "invalid_client",
-      error_description: "Unknown client_id. Register via /oauth/register first."
-    });
+    return res.status(400).json({ error: "invalid_client", error_description: "Unknown client_id." });
   }
 
   if (!redirect_uri || !client.redirect_uris.includes(redirect_uri)) {
-    return res.status(400).json({
-      error: "invalid_request",
-      error_description: "redirect_uri does not match client registration."
-    });
+    return res.status(400).json({ error: "invalid_request", error_description: "Invalid redirect_uri." });
   }
 
   if (!resource) {
-    return res.status(400).json({
-      error: "invalid_target",
-      error_description: "resource parameter is required."
-    });
+    return res.status(400).json({ error: "invalid_target", error_description: "resource parameter is required." });
   }
 
   if (!code_challenge || code_challenge_method !== "S256") {
     return res.status(400).send("OAuth 2.1 requires PKCE with S256 code_challenge_method.");
   }
 
-  // Render simple API Key Input Screen (LLM redirect target)
+  // 2. Render ONLY the API Key input page. 
+  // DO NOT check req.session or redirect to "/" here!
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -310,8 +303,8 @@ app.get("/oauth/authorize", (req, res) => {
     </head>
     <body>
       <div class="card">
-        <h2>MCP Authentication</h2>
-        <p>Please enter your generated API key to connect this MCP App.</p>
+        <h2>MCP API Key Authentication</h2>
+        <p>Enter the API key generated from your dashboard to authorize access.</p>
         <form action="/oauth/authorize" method="POST">
           <input type="hidden" name="client_id" value="${client_id}" />
           <input type="hidden" name="redirect_uri" value="${redirect_uri}" />
