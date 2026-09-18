@@ -1,5 +1,4 @@
-// CUSTOMER BACKEND
-
+// Customer backend
 import express from "express";
 import session from "express-session";
 import crypto from "crypto";
@@ -45,61 +44,11 @@ const MOCK_DATA = {
 };
 
 // ===========================================================================
-// API KEY STORE (PROTOTYPE SIMULATION)
-// Only one API key is ever active at a time. Generating a new one silently
-// overwrites/invalidates the previous one. Only a hash of the key is kept
-// server-side; the raw key is returned to the caller exactly once, at
-// generation time, and can never be retrieved again after that.
-// This is now the ONLY credential that can mint an access token — the old
-// authorization-code/redirect flow has been removed entirely.
-// PROD NOTE: Replace with a persisted, indexed store (DB) if multiple
-// concurrent keys / multiple users are ever needed.
+// OAUTH IN-MEMORY STORES (PROTOTYPE SIMULATION)
+// PROD NOTE: Replace these Map() instances with PostgreSQL/Redis.
 // ===========================================================================
-let activeApiKey = null;
-// shape when set: { hash: string, username: string, issuedAt: number, expiresAt: number }
-
-const API_KEY_MIN_MINUTES = 1;
-const API_KEY_MAX_MINUTES = 1440; // 24h ceiling — keeps the UI from minting a de-facto permanent key
-
-function hashApiKey(rawKey) {
-  return crypto.createHash("sha256").update(rawKey).digest("hex");
-}
-
-function generateAndStoreApiKey(username, minutes) {
-  const rawKey = "sk_" + crypto.randomBytes(32).toString("base64url");
-  const now = Date.now();
-  const expiresAt = now + minutes * 60 * 1000;
-
-  activeApiKey = {
-    hash: hashApiKey(rawKey),
-    username,
-    issuedAt: now,
-    expiresAt
-  };
-
-  return { rawKey, issuedAt: now, expiresAt };
-}
-
-// Freshness + identity check for a presented API key. Constant-time
-// comparison is used so that checking an invalid key can't leak timing
-// information about the stored hash.
-function checkApiKey(providedKey) {
-  if (!activeApiKey) return { valid: false, reason: "no_active_key" };
-  if (Date.now() > activeApiKey.expiresAt) return { valid: false, reason: "expired" };
-  if (typeof providedKey !== "string" || providedKey.length === 0) {
-    return { valid: false, reason: "malformed" };
-  }
-
-  const providedHash = hashApiKey(providedKey);
-  const a = Buffer.from(providedHash, "hex");
-  const b = Buffer.from(activeApiKey.hash, "hex");
-
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return { valid: false, reason: "mismatch" };
-  }
-
-  return { valid: true, username: activeApiKey.username, expiresAt: activeApiKey.expiresAt };
-}
+const registeredClients = new Map(); // client_id -> client metadata
+const authorizationCodes = new Map(); // code -> auth state (code_challenge, userId, resource, etc.)
 
 // ===========================================================================
 // CRYPTOGRAPHIC KEYS (RS256)
@@ -121,19 +70,29 @@ jwk.kid = "prototype-key-1";
 // 1. WEB APP ROUTES & DISCOVERY
 // ===========================================================================
 
-// Still needed: mcp-backend (and, in principle, anyone else who receives one
-// of our tokens) fetches this to verify signatures.
 app.get("/.well-known/jwks.json", (req, res) => {
   res.json({ keys: [jwk] });
 });
 
-// Require an active session (same convention as the rest of the frontend routes)
-function requireSession(req, res, next) {
-  if (!req.session?.isLoggedIn) {
-    return res.status(401).json({ error: "unauthorized", message: "Log in first." });
-  }
-  next();
-}
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const hostUrl = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    issuer: hostUrl,
+    authorization_endpoint: `${hostUrl}/oauth/authorize`,
+    token_endpoint: `${hostUrl}/oauth/token`,
+    registration_endpoint: `${hostUrl}/oauth/register`,
+    jwks_uri: `${hostUrl}/.well-known/jwks.json`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: ["read", "write"]
+  });
+});
+
+app.get("/.well-known/openid-configuration", (req, res) => {
+  res.redirect("/.well-known/oauth-authorization-server");
+});
 
 app.get("/", (req, res) => {
   console.log(`[BACKEND ROOT] Session ID: ${req.sessionID}, LoggedIn: ${!!req.session?.isLoggedIn}`);
@@ -169,51 +128,10 @@ app.get("/", (req, res) => {
           <p>${ws3Text}</p>
         </div>
 
-        <div style="border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; border-radius: 4px;">
-          <h3>API Key (for MCP / external tools)</h3>
-          <div>
-            <label>Valid for (minutes):</label><br>
-            <input type="number" id="apiKeyMinutes" value="15" min="${API_KEY_MIN_MINUTES}" max="${API_KEY_MAX_MINUTES}" style="padding: 5px; width: 100px;" />
-            <button type="button" id="genApiKeyBtn" style="padding: 8px 16px;">Generate API Key</button>
-          </div>
-          <div id="apiKeyResult" style="margin-top: 10px; display: none;">
-            <input type="text" id="apiKeyValue" readonly style="width: 70%; padding: 5px; font-family: monospace;" />
-            <button type="button" id="copyApiKeyBtn" style="padding: 8px 12px;">Copy</button>
-            <p id="apiKeyExpiry" style="font-size: 12px; color: #555;"></p>
-            <p style="font-size: 12px; color: #b00;">This key is shown once. Generating a new one invalidates this one.</p>
-          </div>
-        </div>
-
         <br>
         <form action="/logout" method="POST">
           <button type="submit" style="padding: 8px 16px;">Log Out</button>
         </form>
-
-        <script>
-          document.getElementById("genApiKeyBtn").addEventListener("click", async () => {
-            const minutes = document.getElementById("apiKeyMinutes").value;
-            const res = await fetch("/account/api-key/generate", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ minutes: Number(minutes) })
-            });
-            const data = await res.json();
-            if (!res.ok) {
-              alert(data.message || "Failed to generate API key.");
-              return;
-            }
-            document.getElementById("apiKeyValue").value = data.api_key;
-            document.getElementById("apiKeyExpiry").textContent =
-              "Expires at " + new Date(data.expires_at).toLocaleString();
-            document.getElementById("apiKeyResult").style.display = "block";
-          });
-
-          document.getElementById("copyApiKeyBtn").addEventListener("click", () => {
-            const input = document.getElementById("apiKeyValue");
-            input.select();
-            navigator.clipboard.writeText(input.value);
-          });
-        </script>
       </div>
     `);
   }
@@ -263,63 +181,6 @@ app.post("/logout", (req, res) => {
 });
 
 // ===========================================================================
-// 1b. API KEY ROUTES
-// ===========================================================================
-
-app.post("/account/api-key/generate", requireSession, (req, res) => {
-  const minutesRaw = Number(req.body.minutes);
-
-  if (!Number.isFinite(minutesRaw) || minutesRaw < API_KEY_MIN_MINUTES || minutesRaw > API_KEY_MAX_MINUTES) {
-    return res.status(400).json({
-      error: "invalid_request",
-      message: `minutes must be a number between ${API_KEY_MIN_MINUTES} and ${API_KEY_MAX_MINUTES}.`
-    });
-  }
-
-  const minutes = Math.floor(minutesRaw);
-  const { rawKey, issuedAt, expiresAt } = generateAndStoreApiKey(req.session.username, minutes);
-
-  console.log(`[API-KEY] Generated for ${req.session.username}, valid ${minutes}m (expires ${new Date(expiresAt).toISOString()})`);
-
-  res.json({
-    api_key: rawKey, // shown once — server only retains a hash from here on
-    issued_at: issuedAt,
-    expires_at: expiresAt,
-    expires_in_minutes: minutes
-  });
-});
-
-// Lets the dashboard (or anything else with a session) check key status
-// without ever re-exposing the raw key or the stored hash.
-app.get("/account/api-key/status", requireSession, (req, res) => {
-  if (!activeApiKey || Date.now() > activeApiKey.expiresAt) {
-    return res.json({ active: false });
-  }
-  res.json({
-    active: true,
-    expires_at: activeApiKey.expiresAt,
-    issued_for: activeApiKey.username
-  });
-});
-
-// Standalone freshness/validity check for a presented API key. No session
-// required — kept around as a debug/manual-testing endpoint independent of
-// the token-exchange flow below.
-app.post("/account/api-key/validate", (req, res) => {
-  const { api_key } = req.body;
-  if (!api_key) {
-    return res.status(400).json({ error: "invalid_request", message: "api_key is required." });
-  }
-
-  const result = checkApiKey(api_key);
-  if (!result.valid) {
-    return res.status(401).json({ valid: false, reason: result.reason });
-  }
-
-  res.json({ valid: true, username: result.username, expires_at: result.expiresAt });
-});
-
-// ===========================================================================
 // 2. DATA API (FOR MCP BACKEND CONSUMPTION)
 // ===========================================================================
 
@@ -331,12 +192,11 @@ app.get("/api/data", (req, res) => {
 
   const token = authHeader.split(" ")[1];
   try {
+    // PROD NOTE: Verify signed RS256 JWT
     // NOTE: This endpoint is only ever called internally by mcp-backend, which
-    // forwards a token whose `aud` is the mcp-app resource (see /oauth/token
-    // below — tokens are now minted via the api_key grant instead of an
-    // authorization code, but the aud-binding discipline is unchanged). This
-    // route intentionally does not re-check `aud` itself, since that binding
-    // is enforced at mcp-backend (the actual protected-resource gatekeeper).
+    // forwards a token whose `aud` is the mcp-app resource (see /oauth/token below).
+    // It intentionally does not re-check `aud` here, since that binding is enforced
+    // at mcp-app (the actual protected resource) and again at mcp-backend.
     jwt.verify(token, publicKey, { algorithms: ["RS256"] });
     res.json(MOCK_DATA);
   } catch (err) {
@@ -379,67 +239,171 @@ app.get("/widget/bar-chart", (req, res) => {
 });
 
 // ===========================================================================
-// 3. TOKEN ENDPOINT (API-KEY GRANT ONLY)
-// The authorization-code/redirect flow (registration, /oauth/authorize, AS
-// discovery metadata) has been removed entirely: the only way to obtain an
-// access token in this prototype is by presenting a currently valid API key,
-// generated via the dashboard's "API Key" panel above.
+// 3. OAUTH / MCP BRIDGE ENDPOINTS
 // ===========================================================================
 
-app.post("/oauth/token", (req, res) => {
-  const { grant_type, api_key, resource } = req.body;
+app.post("/oauth/register", (req, res) => {
+  const { redirect_uris } = req.body;
+  const clientId = "client_" + crypto.randomBytes(8).toString("hex");
 
-  if (grant_type !== "api_key") {
+  const clientMetadata = {
+    client_id: clientId,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    redirect_uris: redirect_uris || ["https://chatgpt.com/connector/oauth"],
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none"
+  };
+
+  registeredClients.set(clientId, clientMetadata);
+  res.status(201).json(clientMetadata);
+});
+
+app.get("/oauth/authorize", (req, res) => {
+  const { client_id, redirect_uri, state, code_challenge, code_challenge_method, resource } = req.query;
+
+  // ---------------------------------------------------------------------
+  // Enforce dynamic client registration: previously any client_id/redirect_uri
+  // was accepted regardless of what /oauth/register had stored. Now the
+  // authorize request must reference a client that actually registered, and
+  // the redirect_uri must be one that client registered.
+  // ---------------------------------------------------------------------
+  const client = registeredClients.get(client_id);
+  if (!client) {
     return res.status(400).json({
-      error: "unsupported_grant_type",
-      error_description: "Only grant_type=api_key is supported by this prototype."
+      error: "invalid_client",
+      error_description: "Unknown client_id. Register via /oauth/register first."
+    });
+  }
+  if (!redirect_uri || !client.redirect_uris.includes(redirect_uri)) {
+    return res.status(400).json({
+      error: "invalid_request",
+      error_description: "redirect_uri does not match a redirect_uri registered for this client."
     });
   }
 
-  if (!api_key) {
-    return res.status(400).json({ error: "invalid_request", error_description: "api_key is required." });
-  }
-
-  // Resource Indicator (RFC 8707 flavor, informal here): the caller must
-  // state which protected resource it intends to use the token with. That
-  // value is embedded as the JWT `aud` claim so resource servers (mcp-backend)
-  // can verify a token was actually issued for them, not just signed by us
-  // for some unrelated purpose.
+  // ---------------------------------------------------------------------
+  // Resource Indicator (RFC 8707): the client must state which protected
+  // resource it intends to use the token with. This value is carried
+  // through to /oauth/token and embedded as the JWT `aud` claim, so that
+  // resource servers can verify a token was actually issued for them
+  // instead of accepting any token signed by this AS.
+  // ---------------------------------------------------------------------
   if (!resource) {
     return res.status(400).json({
       error: "invalid_target",
-      error_description: "resource is required to bind the issued token to a specific protected resource."
+      error_description: "resource parameter is required to bind the issued token to a specific protected resource."
     });
   }
   try {
     new URL(resource);
   } catch {
-    return res.status(400).json({ error: "invalid_target", error_description: "resource must be a valid absolute URI." });
+    return res.status(400).json({
+      error: "invalid_target",
+      error_description: "resource must be a valid absolute URI."
+    });
   }
 
-  const result = checkApiKey(api_key);
-  if (!result.valid) {
-    return res.status(401).json({ error: "invalid_grant", error_description: `API key ${result.reason}.` });
+  if (!req.session || !req.session.isLoggedIn) {
+    req.session.returnTo = req.originalUrl;
+    return req.session.save((err) => {
+      if (err) console.error(`[BACKEND AUTHORIZE ERROR] Session save failed:`, err);
+      res.redirect("/");
+    });
   }
 
-  // The access token can never outlive the API key that authorized it, and
-  // is additionally capped at 1h so a long-lived API key doesn't translate
-  // into an equally long-lived bearer token sitting in mcp-app's memory.
-  const msRemainingOnKey = result.expiresAt - Date.now();
-  const expiresInSeconds = Math.max(1, Math.min(3600, Math.floor(msRemainingOnKey / 1000)));
+  // PKCE Check
+  if (!code_challenge || code_challenge_method !== "S256") {
+    return res.status(400).send("OAuth 2.1 requires PKCE with S256 code_challenge_method.");
+  }
 
+  const mockAuthCode = "auth_code_" + crypto.randomBytes(12).toString("hex");
+  authorizationCodes.set(mockAuthCode, {
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    codeChallenge: code_challenge,
+    resource,
+    username: req.session.username,
+    expiresAt: Date.now() + 10 * 60 * 1000
+  });
+
+  if (redirect_uri) {
+    const redirectUrl = new URL(redirect_uri);
+    redirectUrl.searchParams.set("code", mockAuthCode);
+    if (state) redirectUrl.searchParams.set("state", state);
+
+    const hostUrl = `${req.protocol}://${req.get("host")}`;
+    redirectUrl.searchParams.set("iss", hostUrl);
+
+    return res.redirect(redirectUrl.toString());
+  }
+
+  res.send(`Authorization Granted! Code: ${mockAuthCode}`);
+});
+
+app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
+  const { code, grant_type, code_verifier, client_id, resource } = req.body;
+
+  if (grant_type !== "authorization_code" || !code || !code_verifier) {
+    return res.status(400).json({ error: "invalid_request", error_description: "Missing code or code_verifier" });
+  }
+
+  const authData = authorizationCodes.get(code);
+  if (!authData || Date.now() > authData.expiresAt) {
+    authorizationCodes.delete(code);
+    return res.status(400).json({ error: "invalid_grant", error_description: "Code invalid or expired" });
+  }
+
+  authorizationCodes.delete(code);
+
+  // ---------------------------------------------------------------------
+  // If a client_id is supplied in the token request, it must match the
+  // client the code was actually issued to at /oauth/authorize. Previously
+  // a client-supplied client_id would silently override the bound one when
+  // signing the token, breaking the binding between code and client.
+  // ---------------------------------------------------------------------
+  if (client_id && client_id !== authData.clientId) {
+    return res.status(400).json({
+      error: "invalid_grant",
+      error_description: "client_id does not match the client this authorization code was issued to."
+    });
+  }
+
+  // If a resource is supplied here, it must match what was requested at
+  // /oauth/authorize (RFC 8707 §2) — a client can't authorize for one
+  // resource and redeem the code for a token scoped to a different one.
+  if (resource && resource !== authData.resource) {
+    return res.status(400).json({
+      error: "invalid_target",
+      error_description: "resource does not match the resource requested during authorization."
+    });
+  }
+
+  // PKCE Validation
+  const calculatedChallenge = crypto
+    .createHash("sha256")
+    .update(code_verifier)
+    .digest("base64url");
+
+  if (calculatedChallenge !== authData.codeChallenge) {
+    return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+  }
+
+  // Issue Signed RS256 JWT, bound to the client and resource captured at
+  // authorize-time (never from request-body input at this point).
   const hostUrl = `${req.protocol}://${req.get("host")}`;
   const accessToken = jwt.sign(
     {
-      sub: result.username,
+      sub: authData.username,
+      client_id: authData.clientId,
       scope: "read write"
     },
     privateKey,
     {
       algorithm: "RS256",
-      expiresIn: expiresInSeconds,
+      expiresIn: "1h",
       issuer: hostUrl,
-      audience: resource,
+      audience: authData.resource,
       keyid: "prototype-key-1"
     }
   );
@@ -447,7 +411,7 @@ app.post("/oauth/token", (req, res) => {
   res.json({
     access_token: accessToken,
     token_type: "Bearer",
-    expires_in: expiresInSeconds
+    expires_in: 3600
   });
 });
 
